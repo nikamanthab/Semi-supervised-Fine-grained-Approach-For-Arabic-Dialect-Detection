@@ -14,10 +14,9 @@
 
 
 ### Performance
-The model was trained with 75% of the data from each subclass benign and malware.
-Then tested on remaining 25% data from each class.
+The model was trained on 21,000 labelled and 10M unlabelled data set.
 
-The performance on the 25% development set:
+The test performance:
 | Task    | macro F1 score | accuracy | 
 | ------  | -------- | ------ |
 | Task1 (21 classes)  | 0.2004     | 0.3366 |
