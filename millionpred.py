@@ -1,0 +1,128 @@
+import numpy as np
+import pandas as pd
+import os
+import torch
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import Linear,Softmax,CrossEntropyLoss,Module,ReLU,DataParallel,Sequential
+from torch.optim import Adam
+from tqdm import tqdm_notebook
+from nltk import word_tokenize
+from pymagnitude import *
+from sklearn.metrics import accuracy_score, f1_score
+from tqdm import tqdm
+from time import time
+from sentence_transformers import SentenceTransformer
+import csv
+
+import warnings
+warnings.filterwarnings('ignore')
+
+device = 'cpu'
+
+train_df = pd.read_csv('../NADI-2020_release_1.0/NADI_release/train_labeled.tsv','\t')
+dev_df = pd.read_csv('../NADI-2020_release_1.0/NADI_release/dev_labeled.tsv',sep='\t')
+
+label_map = {}
+y_train_original = train_df["#3 country_label"]
+for u in range(len(y_train_original.unique())):
+    label_map[y_train_original.unique()[u]] = int(u)
+reverse_label_map = {value : key for (key, value) in label_map.items()}
+def label_onehot(label):
+    onehot = np.zeros((21))
+    index = label_map[label]
+    onehot[index] = 1
+    return onehot
+
+fast = Magnitude("../downloads/fasttext-arabic/fasttext-arabic.magnitude",devices=[0,1],lazy_loading=-1)
+def transform(x):
+    vectors = []
+    for title in x:
+        vectors.append(np.average(fast.query(word_tokenize(title)), axis = 0))
+    return np.array(vectors)
+
+
+class ArabicDataset(Dataset):
+    def __init__(self, csv_file=None, million_csv=None, transform=None):        
+        self.csv_file = csv_file
+        if csv_file:         
+            if million_csv:
+                self.text_df = pd.concat([pd.read_csv(csv_file, sep='\t'),
+                                         pd.read_csv(million_csv, sep='\t')])
+            else:
+                self.text_df = pd.read_csv(csv_file,sep='\t')
+        else:
+            self.text_df = pd.read_csv(million_csv,sep='\t')
+#         self.fasttext_data = transform(self.text_df['#2 tweet_content'])
+    def __len__(self):
+        return len(self.text_df)
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+#         text = self.fasttext_data[idx]
+        text = self.text_df.iloc[idx]['#2 tweet_content']
+        text = transform([text]).reshape((300))
+        if self.csv_file:
+            label = self.text_df.iloc[idx]['#3 country_label']
+            label = label_onehot(label)
+            sample = {'text': text, 
+                      'id':self.text_df.iloc[idx]['#1 tweet_ID'],
+                      'label': torch.from_numpy(label).to(device)}
+        else:
+            sample = {'text':text,
+                      'content': self.text_df.iloc[idx]['#2 tweet_content'],
+                     'id':self.text_df.iloc[idx]['#1 tweet_ID']}
+        return sample
+    
+    
+class TuningNet(Module):
+    def __init__(self, D_in, H,D_out):
+        super(TuningNet, self).__init__()
+        self.linear1 = torch.nn.Linear(D_in, H)
+        self.linear2 = torch.nn.Linear(H, D_out)
+        self.relu = ReLU()
+        self.softmax = Softmax(dim=1)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+        y_pred = self.softmax(x)
+        return y_pred
+    
+train_csv_path = '../tsv/added_train.tsv'
+dev_csv_path = '../tsv/final/dev_for_pytorch.tsv'
+million_csv_path = '../tsv/final/million_for_pytorch.tsv'
+num_of_epochs = 50
+learning_rate = 0.001
+#model = TuningNet(300,512,21).to(device)
+train_batch_size = 32
+
+model = torch.load('../semi-supervised_train/models/task1-sgd.pt').to(device)
+
+devdataset = ArabicDataset(million_csv=dev_csv_path)
+devloader = DataLoader(devdataset, batch_size=1)
+
+criterian = CrossEntropyLoss().to(device)
+optimizer = Adam(model.parameters(), lr=learning_rate)
+train_f1 = []
+dev_f1 = []
+y_pred = []
+y_true = []
+num_of_epochs=1
+for epoch in range(num_of_epochs):       
+    y_pred = []
+    y_true = []
+    
+    with open('../tsv/dev_pred.txt', 'wt') as out_file:
+        tsv_writer = csv.writer(out_file, delimiter='\t')
+        tsv_writer.writerow(['#1 tweet_ID', '#2 tweet_content', '#3 country_label', 'conf'])
+        
+        for batch in tqdm(devloader):
+            output = model(batch['text'].to(device))
+            index = output.argmax(dim=1).detach().cpu().numpy()[0]
+            out_file.write(reverse_label_map[index]+'\n')
+            tsv_writer.writerow([str(batch['id'][0]),
+                    batch['content'][0],
+                    reverse_label_map[index],
+                    str(float(output[0][index].detach().cpu().numpy()))])
